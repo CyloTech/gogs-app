@@ -23,7 +23,7 @@ DISABLE_SSH      = false
 OFFLINE_MODE     = false
 
 [database]
-DB_TYPE  = mysql
+DB_TYPE  = sqlite3
 HOST     = 127.0.0.1:3306
 NAME     = gogs
 USER     = gogs
@@ -62,9 +62,6 @@ SECRET_KEY   = ${SECRET_KEY}
 EOT
 
     chown -R git:git /home/git
-
-    /bin/sh /scripts/mysql.sh
-
     mkdir -p /var/log/gogs/
 
 cat << EOF >> /etc/supervisor/conf.d/gogs.conf
@@ -90,11 +87,11 @@ EOF
     setcap cap_net_bind_service=+ep /home/git/gogs/gogs
 
     cd /home/git/gogs
+    exec su -c "./gogs web" -s /bin/sh git &
+    sleep 10
     exec su -c "./gogs admin create-user --name ${ADMIN_USER} --password ${ADMIN_PASS} --admin --email ${ADMIN_EMAIL}" -s /bin/sh git &
-    sleep 5
+    sleep 10
     pkill -9 gogs
-    pkill -9 mysql
-    sleep 5
 
     curl -i -H "Accept: application/json" -H "Content-Type:application/json" -X POST "https://api.cylo.io/v1/apps/installed/$INSTANCE_ID"
     touch /etc/gogs_installed

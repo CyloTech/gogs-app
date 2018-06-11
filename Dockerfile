@@ -3,7 +3,6 @@ FROM ubuntu:18.04
 ENV HOME=/home/git \
     DEBIAN_FRONTEND=noninteractive \
     GOGS_VERSION=0.11.53 \
-    MYSQL_ROOT_PASSWORD=mysqlr00t \
     ADMIN_USER=gogsadmin \
     ADMIN_PASS=admin \
     ADMIN_EMAIL=admin@test.com \
@@ -19,7 +18,6 @@ RUN apt install -y wget \
                    git \
                    supervisor \
                    libcap2-bin \
-                   mysql-server \
                    pwgen
 
 RUN adduser --system --disabled-password --home ${HOME} --shell /sbin/nologin --group --uid 1000 git
@@ -30,7 +28,6 @@ RUN cd /home/git && \
     rm -fr /home/git/gogs_*
 
 ADD /scripts /scripts
-ADD /sources /sources
 RUN chmod -R +x /scripts
 
 EXPOSE 80
