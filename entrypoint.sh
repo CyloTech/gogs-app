@@ -6,6 +6,8 @@ CONFIG_FLAG="/etc/app_configured"
 APP_INI="/home/git/gogs/custom/conf/app.ini"
 GOGS_DIR="/home/git/gogs"
 LOCAL_URL="http://localhost:3000"
+CALLBACK_PENDING_FLAG="/etc/appbox_callback_pending"
+CALLBACK_HELPER="/usr/local/bin/appbox-installed-callback"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -27,25 +29,22 @@ wait_for_http() {
     done
 }
 
-callback_installed() {
-    if [[ "${SKIP_APPBOX_CALLBACK:-0}" == "1" ]]; then
-        echo "Skipping Appbox callback (SKIP_APPBOX_CALLBACK=1)"
-        return 0
+# Send the pending Appbox installed callback once Gogs answers. This runs in
+# the background: the API accepts one installed callback per install or
+# update and rejects the rest (401 once the token has been used or cleared, or
+# when serverapi has already called back), so waiting for it in front of
+# `exec` kept Gogs down forever. The helper retries network errors, 408, 429
+# and 5xx, logs any other status once and stops. It runs as a separate
+# script, so `set -x` here never traces INSTANCE_ID or CALLBACK_TOKEN.
+send_pending_callback() {
+    set +e
+
+    if ! wait_for_http "${LOCAL_URL}" 150 2; then
+        echo "WARNING: Gogs did not answer; sending the installed callback anyway."
     fi
 
-    local callback_url="https://api.cylo.net/v1/apps/installed/${INSTANCE_ID}"
-    local headers=(
-        -H "Accept: application/json"
-        -H "Content-Type:application/json"
-    )
-
-    if [[ -n "${CALLBACK_TOKEN:-}" ]]; then
-        headers+=(-H "Authorization: Bearer ${CALLBACK_TOKEN}")
-    fi
-
-    until curl -fsS -o /dev/null "${headers[@]}" -X POST "${callback_url}"; do
-        sleep 5
-    done
+    "${CALLBACK_HELPER}"
+    rm -f "${CALLBACK_PENDING_FLAG}"
 }
 
 # Resolve env vars that may not be set during local testing.
@@ -70,6 +69,9 @@ chown -R 1000:1000 /home/git/gogs/custom \
 cd "${GOGS_DIR}"
 
 if [[ ! -f "${CONFIG_FLAG}" ]]; then
+    # Only mark the callback pending (before CONFIG_FLAG, so a crash during
+    # setup cannot lose it); it is sent in the background before `exec`.
+    touch "${CALLBACK_PENDING_FLAG}"
     touch "${CONFIG_FLAG}"
 
     if [[ ! -f "${APP_INI}" ]]; then
@@ -197,8 +199,10 @@ EOF
         sed -i "/^ENABLE_NOTIFY_MAIL/d" "${APP_INI}"
         sed -i "/^ENABLE_EMAIL_NOTIFICATION/d" "${APP_INI}"
     fi
+fi
 
-    callback_installed
+if [[ -f "${CALLBACK_PENDING_FLAG}" ]]; then
+    send_pending_callback </dev/null &
 fi
 
 # ---------------------------------------------------------------------------

@@ -24,7 +24,8 @@ RUN cd /home/git && \
 
 ADD entrypoint.sh /entrypoint.sh
 ADD moduser.sh /moduser.sh
-RUN chmod +x /entrypoint.sh /moduser.sh
+ADD appbox-installed-callback /usr/local/bin/appbox-installed-callback
+RUN chmod +x /entrypoint.sh /moduser.sh && chmod 755 /usr/local/bin/appbox-installed-callback
 
 ENTRYPOINT ["/entrypoint.sh"]
 CMD ["/home/git/gogs/gogs", "web"]
