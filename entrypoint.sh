@@ -154,13 +154,36 @@ EOF
         gosu "${APP_USER}" "$@" &
         APP_PID=$!
 
-        wait_for_http "${LOCAL_URL}" 90 2 || true
+        # Gogs sets up a new database before it answers, which takes seconds
+        # on a quiet disk and minutes on a busy one; create-user fails with
+        # "database is locked" until it has finished. Wait for as long as
+        # Gogs keeps running (up to 15 minutes), then retry create-user while
+        # it still reports a locked database.
+        wait_attempts=0
+        until curl -sf "${LOCAL_URL}" >/dev/null 2>&1; do
+            wait_attempts=$((wait_attempts + 1))
+            if ! kill -0 "${APP_PID}" 2>/dev/null || [[ "${wait_attempts}" -ge 450 ]]; then
+                echo "Gogs did not answer on ${LOCAL_URL}"
+                break
+            fi
+            sleep 2
+        done
 
-        if ! gosu "${APP_USER}" "${GOGS_DIR}/gogs" admin create-user \
+        for create_attempt in 1 2 3 4 5 6; do
+            create_status=0
+            create_output=$(gosu "${APP_USER}" "${GOGS_DIR}/gogs" admin create-user \
                 --name "${ADMIN_USER}" \
                 --password "${ADMIN_PASS}" \
                 --admin \
-                --email "${ADMIN_EMAIL}"; then
+                --email "${ADMIN_EMAIL}" 2>&1) || create_status=$?
+            echo "${create_output}"
+            if [[ "${create_status}" == 0 || "${create_output}" != *"database is locked"* ]]; then
+                break
+            fi
+            echo "The Gogs database is still locked (attempt ${create_attempt}); retrying in 10s."
+            sleep 10
+        done
+        if [[ "${create_status}" != 0 ]]; then
             echo "WARNING: Admin user creation failed. Manual setup may be required."
         fi
 

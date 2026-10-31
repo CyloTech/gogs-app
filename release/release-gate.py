@@ -125,7 +125,7 @@ def redact(text):
     return text
 
 
-def command(args, timeout=300, check=True):
+def command(args, timeout=900, check=True):
     p = subprocess.run(args, capture_output=True, timeout=timeout)
     if check and p.returncode:
         # Never print the arguments: they carry the dummy passwords.
@@ -133,7 +133,7 @@ def command(args, timeout=300, check=True):
     return p
 
 
-def out(args, timeout=300):
+def out(args, timeout=900):
     return command(args, timeout).stdout.decode()
 
 
@@ -304,7 +304,7 @@ def api_login(base, username, user_password):
     return json.loads(body).get('username') == username
 
 
-def wait_login(name, username, user_password, legacy=False, limit=300):
+def wait_login(name, username, user_password, legacy=False, limit=900):
     last = ''
     for _ in range(limit // 3):
         state = out(['docker', 'inspect', '--format', '{{.State.Running}}', name]).strip()
@@ -509,6 +509,7 @@ try:
     check_repo(fresh, 'gate-fresh', user, password)
     check_callback(wait_callbacks(mock, 1))
     assert 'installed callback accepted (HTTP 200)' in logs(fresh), 'helper did not report the callback'
+    assert 'Admin user creation failed' not in logs(fresh), 'admin user creation reported a failure'
     check_not_logged(fresh, secret_values)
     check_not_stored(fresh, secret_values)
     print('PASS fresh: API and web login, wrong password refused, registration disabled, app.ini values, '

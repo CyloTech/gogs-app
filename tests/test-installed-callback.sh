@@ -11,8 +11,9 @@
 #     pending flag, traces none of its commands and keeps the callback token
 #     and the admin password out of its output;
 #   - a fresh install creates the admin user from ADMIN_USER, ADMIN_PASS and
-#     ADMIN_EMAIL, and refuses to start (no callback, no markers, no files)
-#     when any of them is missing or empty; an update does not need them.
+#     ADMIN_EMAIL (retrying while Gogs reports a locked database), and
+#     refuses to start (no callback, no markers, no files) when any of them
+#     is missing or empty; an update does not need them.
 #
 # Usage: tests/test-installed-callback.sh
 set -u
@@ -278,11 +279,22 @@ make_sandbox() {
 }
 
 # Stubs for a first start: gosu drops its user argument, and the gogs binary
-# records its arguments in ${work}/gogs_args.
+# records its arguments in ${work}/gogs_args and each call in
+# ${work}/gogs_calls. With locked_calls=N it first fails N times the way
+# Gogs does while it is still setting up its database.
 fresh_stubs() {
+    local locked_calls=${1:-0}
     mkdir -p "${work}/bin" "${work}/home/git/gogs"
     printf '#!/bin/bash\nshift\nexec "$@"\n' >"${work}/bin/gosu"
-    printf '#!/bin/bash\nprintf "%%s\\n" "$@" >"%s/gogs_args"\n' "${work}" >"${work}/home/git/gogs/gogs"
+    cat >"${work}/home/git/gogs/gogs" <<EOF
+#!/bin/bash
+echo call >>"${work}/gogs_calls"
+if [[ \$(wc -l <"${work}/gogs_calls") -le ${locked_calls} ]]; then
+    echo "[FATAL] Failed to start application: set engine: open database: database is locked (5) (SQLITE_BUSY)"
+    exit 1
+fi
+printf '%s\\n' "\$@" >"${work}/gogs_args"
+EOF
     chmod +x "${work}/bin/gosu" "${work}/home/git/gogs/gogs"
 }
 
@@ -338,6 +350,39 @@ fresh_case() {
     stop_mock
 }
 
+# create-user is retried while Gogs reports a locked database: the admin
+# user is created on the second call and Gogs starts.
+locked_case() {
+    start_mock 200
+    fresh_stubs 1
+    if ! make_sandbox; then
+        fail "entrypoint fresh with a locked database: could not sandbox the final exec"
+        stop_mock
+        return
+    fi
+    run_limited 40 env -u ADMIN_USER -u ADMIN_PASS -u ADMIN_EMAIL \
+        INSTANCE_ID="${token_id}" CALLBACK_TOKEN="${header_token}" \
+        APPBOX_CALLBACK_BASE="http://127.0.0.1:${port}" APPBOX_CALLBACK_RETRY_DELAY=1 \
+        "${admin_env[@]}" PATH="${work}/bin:${PATH}" \
+        "${work}/entrypoint.sh" bash -c "echo started >>'${work}/app_runs'; sleep 1" \
+        >"${work}/output" 2>&1 </dev/null
+    local rc=$? waited=0
+    while [[ -f "${work}/callback_pending" && "${waited}" -lt 20 ]]; do
+        sleep 1
+        waited=$((waited + 1))
+    done
+    if [[ "${rc}" == 0 && "$(wc -l <"${work}/gogs_calls" 2>/dev/null | tr -d ' ')" == 2 \
+        && "$(sed -n 6p "${work}/gogs_args" 2>/dev/null)" == "${admin_password}" \
+        && "$(wc -l <"${work}/app_runs" | tr -d ' ')" == 2 && "$(request_count)" == 1 \
+        && "$(token_logged)" == 0 && "$(traced)" == 0 ]] \
+        && ! grep -q 'Admin user creation failed' "${work}/output"; then
+        pass "entrypoint fresh with a locked database: create-user retried, admin created, Gogs started"
+    else
+        fail "entrypoint fresh with a locked database: exit=${rc} calls=$(cat "${work}/gogs_calls" 2>/dev/null | wc -l) requests=$(request_count)"
+    fi
+    stop_mock
+}
+
 # Without one of the install values, a first start stops before setting
 # anything up: Gogs does not start, nothing is sent, and no marker, flag,
 # directory or app.ini is created.
@@ -387,6 +432,7 @@ entrypoint_case restart-pending 503,200 2
 entrypoint_case restart 200 0
 fresh_case 200 1
 fresh_case 401 1
+locked_case
 for name in ADMIN_USER ADMIN_PASS ADMIN_EMAIL; do
     refused_case "${name}" unset
     refused_case "${name}" empty
