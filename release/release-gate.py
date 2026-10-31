@@ -26,7 +26,9 @@ authenticated registry reports the tag definitively absent:
 - upgrade from gogs:latest (Gogs 0.13.2, which kept app.ini inside the
   container and has no custom volume) onto its data and repository volumes
   plus a new empty custom volume, as the 0.14.2-1 catalogue version mounts
-  them: the same checks, and registration is now disabled.
+  them: the same checks, and registration is now disabled. If a baseline's
+  own entrypoint fails to create its admin on a busy builder (both old
+  entrypoints have a short, fixed wait), the gate creates it and says so.
 
 The installed callback goes to a local HTTPS mock that answers as
 api.cylo.io/api.cylo.net on a private Docker network; the containers trust a
@@ -258,11 +260,10 @@ def base_url(name, legacy=False):
     return 'http://127.0.0.1:%d' % host_port(name, '80' if legacy else '3000')
 
 
-def api(base, path, username=None, user_password=None, body=None, method=None):
+def api(base, path, auth=None, body=None, method=None):
     headers = {'Accept': 'application/json'}
-    if username is not None:
-        token = base64.b64encode(('%s:%s' % (username, user_password)).encode()).decode()
-        headers['Authorization'] = 'Basic ' + token
+    if auth is not None:
+        headers['Authorization'] = auth
     data = None
     if body is not None:
         data = json.dumps(body).encode()
@@ -280,6 +281,23 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+def basic(username, user_password):
+    return 'Basic ' + base64.b64encode(('%s:%s' % (username, user_password)).encode()).decode()
+
+
+def api_token(base, username, user_password):
+    """Create an access token with the password; None when Gogs refuses it.
+
+    Gogs 0.14 accepts a password (Basic auth) only on the token endpoint;
+    every other API call needs a token.
+    """
+    status, body = api(base, '/api/v1/users/%s/tokens' % username, basic(username, user_password),
+                       {'name': 'gate-' + secrets.token_hex(4)})
+    if status != 201:
+        return None
+    return 'token ' + json.loads(body)['sha1']
+
+
 def web_login(base, username, user_password):
     """Sign in through the login form. True when Gogs redirects away from it."""
     opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()), NoRedirect)
@@ -294,14 +312,18 @@ def web_login(base, username, user_password):
     except urllib.error.HTTPError as error:
         if error.code in (302, 303):
             return '/user/login' not in (error.headers.get('Location') or '')
+        if error.code == 401:
+            return False
         raise
 
 
 def api_login(base, username, user_password):
-    status, body = api(base, '/api/v1/user', username, user_password)
-    if status != 200:
+    """True when the password gets a token and the token identifies the user."""
+    auth = api_token(base, username, user_password)
+    if auth is None:
         return False
-    return json.loads(body).get('username') == username
+    status, body = api(base, '/api/v1/user', auth)
+    return status == 200 and json.loads(body).get('username') == username
 
 
 def wait_login(name, username, user_password, legacy=False, limit=900):
@@ -332,7 +354,7 @@ def check_logins(name, username, user_password, wrong_password):
 
 def create_repo(name, repo, username, user_password, legacy=False):
     base = base_url(name, legacy)
-    status, body = api(base, '/api/v1/user/repos', username, user_password,
+    status, body = api(base, '/api/v1/user/repos', api_token(base, username, user_password),
                        {'name': repo, 'description': 'Gate ' + repo, 'auto_init': True, 'readme': 'Default',
                         'private': False})
     assert status == 201, 'repository not created: HTTP %d %s' % (status, redact(body)[:300])
@@ -340,7 +362,7 @@ def create_repo(name, repo, username, user_password, legacy=False):
 
 def create_second_user(name, admin_password, legacy=False):
     base = base_url(name, legacy)
-    status, body = api(base, '/api/v1/admin/users', user, admin_password,
+    status, body = api(base, '/api/v1/admin/users', api_token(base, user, admin_password),
                        {'username': second_user, 'email': 'second@example.test', 'password': second_password,
                         'send_notify': False, 'source_id': 0, 'login_name': ''})
     assert status == 201, 'second user not created: HTTP %d %s' % (status, redact(body)[:300])
@@ -348,7 +370,8 @@ def create_second_user(name, admin_password, legacy=False):
 
 def check_repo(name, repo, username, user_password):
     base = base_url(name)
-    status, body = api(base, '/api/v1/repos/%s/%s/raw/master/README.md' % (user, repo), username, user_password)
+    status, body = api(base, '/api/v1/repos/%s/%s/raw/master/README.md' % (user, repo),
+                       api_token(base, username, user_password))
     assert status == 200 and repo in body, 'README of %s not readable: HTTP %d' % (repo, status)
     target = work / ('clone-' + name + '-' + repo)
     command(['git', 'clone', '--quiet', '--depth', '1', '%s/%s/%s.git' % (base, user, repo), str(target)],
@@ -420,6 +443,35 @@ def refused(suffix, mock, env):
     print('PASS refused (%s): exit %s, nothing written, no callback' % (suffix, status), flush=True)
 
 
+def ensure_baseline_admin(name, admin_password, legacy):
+    """Create the admin by hand when a baseline's own entrypoint could not.
+
+    The 0.14.2 and 0.13.2 entrypoints give Gogs 180s and 10s to set up its
+    database before create-user, which a busy builder can miss; that says
+    nothing about upgrading. Call it after the baseline's installed callback,
+    which both send only after their create-user step. Returns True when the
+    gate had to create the admin.
+    """
+    base = base_url(name, legacy)
+    deadline = time.monotonic() + 900
+    while True:
+        try:
+            with urllib.request.urlopen(base + '/', timeout=20) as response:
+                if response.status == 200:
+                    break
+        except OSError:
+            pass
+        if time.monotonic() > deadline:
+            show_logs(name)
+            raise RuntimeError(name + ' did not answer')
+        time.sleep(3)
+    if api_login(base, user, admin_password):
+        return False
+    command(['docker', 'exec', '-u', '1000', '-w', '/home/git/gogs', name, './gogs', 'admin', 'create-user',
+             '--name', user, '--password', admin_password, '--admin', '--email', email])
+    return True
+
+
 def upgrade(kind, mock, callbacks_seen):
     """Install the baseline, add data, stop it, start 0.14.2-1 on the same volumes."""
     legacy = kind == 'legacy'
@@ -431,9 +483,12 @@ def upgrade(kind, mock, callbacks_seen):
     baseline_image = registry.LEGACY if legacy else registry.CURRENT
     baseline = launch('baseline-' + kind, baseline_image, baseline_mounts, install_env(upgrade_password),
                       legacy=legacy)
-    wait_login(baseline, user, upgrade_password, legacy=legacy)
     callbacks_seen += 1
-    wait_callbacks(mock, callbacks_seen)
+    wait_callbacks(mock, callbacks_seen, limit=900)
+    if ensure_baseline_admin(baseline, upgrade_password, legacy):
+        print('INFO the %s baseline did not create its admin on this builder; the gate created it' % kind,
+              flush=True)
+    wait_login(baseline, user, upgrade_password, legacy=legacy)
     create_repo(baseline, 'gate-' + kind, user, upgrade_password, legacy=legacy)
     create_second_user(baseline, upgrade_password, legacy=legacy)
     baseline_leaked = upgrade_password in logs(baseline)
