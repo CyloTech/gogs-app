@@ -1,5 +1,6 @@
 #!/bin/bash
-set -x
+# No `set -x`: the first start passes ADMIN_PASS to `gogs admin create-user`,
+# and tracing would print it into the container log.
 
 APP_USER="1000:1000"
 CONFIG_FLAG="/etc/app_configured"
@@ -34,8 +35,8 @@ wait_for_http() {
 # update and rejects the rest (401 once the token has been used or cleared, or
 # when serverapi has already called back), so waiting for it in front of
 # `exec` kept Gogs down forever. The helper retries network errors, 408, 429
-# and 5xx, logs any other status once and stops. It runs as a separate
-# script, so `set -x` here never traces INSTANCE_ID or CALLBACK_TOKEN.
+# and 5xx, logs any other status once and stops, and never logs
+# CALLBACK_TOKEN or the token in INSTANCE_ID.
 send_pending_callback() {
     set +e
 
@@ -51,6 +52,19 @@ send_pending_callback() {
 DOMAIN="${DOMAIN:-localhost}"
 SSH_PORT="${SSH_PORT:-10022}"
 ROOT_URL="${ROOT_URL:-http://localhost:3000/}"
+
+# A fresh install creates the admin account from the install form. There are
+# no built-in defaults, so refuse to set Gogs up without all three values (and
+# do not report the install as finished). An update keeps its app.ini and
+# users and does not need them.
+if [[ ! -f "${CONFIG_FLAG}" && ! -f "${APP_INI}" ]]; then
+    for required in ADMIN_USER ADMIN_PASS ADMIN_EMAIL; do
+        if [[ -z "${!required:-}" ]]; then
+            echo "${required} is empty; refusing to set up Gogs without it." >&2
+            exit 1
+        fi
+    done
+fi
 
 # Ensure volume directories exist with correct ownership.
 mkdir -p /home/git/gogs/custom/conf \
@@ -141,10 +155,6 @@ EOF
         APP_PID=$!
 
         wait_for_http "${LOCAL_URL}" 90 2 || true
-
-        ADMIN_USER="${ADMIN_USER:-admin}"
-        ADMIN_PASS="${ADMIN_PASS:-admin}"
-        ADMIN_EMAIL="${ADMIN_EMAIL:-admin@localhost}"
 
         if ! gosu "${APP_USER}" "${GOGS_DIR}/gogs" admin create-user \
                 --name "${ADMIN_USER}" \

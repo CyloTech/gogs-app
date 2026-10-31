@@ -8,7 +8,11 @@
 #     callback token carried in INSTANCE_ID;
 #   - entrypoint.sh execs Gogs straight away even when the API rejects the
 #     callback, sends a pending callback once in the background, clears the
-#     pending flag and keeps the callback token out of its `set -x` trace.
+#     pending flag, traces none of its commands and keeps the callback token
+#     and the admin password out of its output;
+#   - a fresh install creates the admin user from ADMIN_USER, ADMIN_PASS and
+#     ADMIN_EMAIL, and refuses to start (no callback, no markers, no files)
+#     when any of them is missing or empty; an update does not need them.
 #
 # Usage: tests/test-installed-callback.sh
 set -u
@@ -17,6 +21,8 @@ repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 helper="${repo_root}/appbox-installed-callback"
 token_id='999?callback_token=querytoken0123456789'
 header_token='headertoken0123456789'
+admin_password='gatepassword0123456789'
+admin_env=(ADMIN_USER=gateadmin "ADMIN_PASS=${admin_password}" ADMIN_EMAIL=gate@example.test)
 
 # Answers GET with 200 (readiness) and each POST with the next status from a
 # comma-separated list, logging what it received.
@@ -92,7 +98,8 @@ run_limited() {
 }
 
 request_count() { cat "${work}/requests" 2>/dev/null | wc -l | tr -d ' '; }
-token_logged() { grep -cE 'querytoken|headertoken' "${work}/output"; }
+token_logged() { grep -cE 'querytoken|headertoken|gatepassword' "${work}/output"; }
+traced() { grep -c '^+' "${work}/output"; }
 
 # --- helper ------------------------------------------------------------------
 
@@ -189,7 +196,8 @@ run_sandboxed_entrypoint() {
     chmod +x "${sandbox}"
     local started_at app_at entrypoint_pid waited=0
     started_at=$(date +%s)
-    env INSTANCE_ID="${token_id}" CALLBACK_TOKEN="${header_token}" \
+    env -u ADMIN_USER -u ADMIN_PASS -u ADMIN_EMAIL \
+        INSTANCE_ID="${token_id}" CALLBACK_TOKEN="${header_token}" \
         APPBOX_CALLBACK_BASE="http://127.0.0.1:${port}" \
         APPBOX_CALLBACK_RETRY_DELAY=1 "$@" \
         "${sandbox}" bash -c "date +%s >'${work}/app_started'; sleep 1" \
@@ -216,14 +224,15 @@ run_sandboxed_entrypoint() {
     sleep 0.5
 
     app_at=$(cat "${work}/app_started" 2>/dev/null || echo 0)
-    local requests leaked
+    local requests leaked trace_lines
     requests=$(request_count)
     leaked=$(token_logged)
+    trace_lines=$(traced)
     if [[ "${app_at}" -gt 0 && $((app_at - started_at)) -le 2 && ! -f "${work}/callback_pending" \
-        && "${requests}" == "${want_requests}" && "${leaked}" == 0 ]]; then
+        && "${requests}" == "${want_requests}" && "${leaked}" == 0 && "${trace_lines}" == 0 ]]; then
         pass "${label}: app started after $((app_at - started_at))s, requests=${requests}"
     else
-        fail "${label}: app_started=${app_at} start=${started_at} pending=$([[ -f "${work}/callback_pending" ]] && echo yes || echo no) requests=${requests}/${want_requests} token_logged=${leaked}"
+        fail "${label}: app_started=${app_at} start=${started_at} pending=$([[ -f "${work}/callback_pending" ]] && echo yes || echo no) requests=${requests}/${want_requests} secret_logged=${leaked} traced=${trace_lines}"
     fi
 }
 
@@ -250,37 +259,119 @@ if ! sed --version 2>/dev/null | grep -q GNU && command -v gsed >/dev/null; then
     ln -s "$(command -v gsed)" "${gnu_sed_dir}/sed"
 fi
 
-# Run a copy of entrypoint.sh (with its `set -x`) with /home/git, the marker,
-# flag, helper and local URL pointed into the scratch directory, chown
-# disabled and gosu removed.
-#   state: upgrade (no /etc/app_configured, app.ini present), restart-pending
-#   (marker and pending flag present) or restart (marker only).
-entrypoint_case() {
-    local state=$1 codes=$2 want_requests=$3
-    start_mock "${codes}"
-    mkdir -p "${work}/home/git/gogs/custom/conf"
-    local sandbox="${work}/entrypoint.sh"
+# Write a copy of entrypoint.sh to ${work}/entrypoint.sh with /home/git, the
+# marker, flag, helper and local URL pointed into the scratch directory, chown
+# disabled and gosu removed from the final exec. Fails if the final exec could
+# not be rewritten.
+make_sandbox() {
     sed -e "s|/home/git|${work}/home/git|g" \
         -e "s|^CONFIG_FLAG=.*|CONFIG_FLAG=\"${work}/app_configured\"|" \
         -e "s|^LOCAL_URL=.*|LOCAL_URL=\"http://127.0.0.1:${port}\"|" \
         -e "s|^CALLBACK_PENDING_FLAG=.*|CALLBACK_PENDING_FLAG=\"${work}/callback_pending\"|" \
         -e "s|^CALLBACK_HELPER=.*|CALLBACK_HELPER=\"${helper}\"|" \
         -e 's|^chown -R 1000:1000 |: chown -R 1000:1000 |' \
+        -e 's|^\( *\)chown 1000:1000 |\1: chown 1000:1000 |' \
         -e 's|^exec gosu "${APP_USER}" "$@"$|exec "$@"|' \
-        "${entrypoint}" >"${sandbox}"
-    if ! grep -q '^exec "\$@"$' "${sandbox}"; then
+        "${entrypoint}" >"${work}/entrypoint.sh"
+    chmod +x "${work}/entrypoint.sh"
+    grep -q '^exec "\$@"$' "${work}/entrypoint.sh"
+}
+
+# Stubs for a first start: gosu drops its user argument, and the gogs binary
+# records its arguments in ${work}/gogs_args.
+fresh_stubs() {
+    mkdir -p "${work}/bin" "${work}/home/git/gogs"
+    printf '#!/bin/bash\nshift\nexec "$@"\n' >"${work}/bin/gosu"
+    printf '#!/bin/bash\nprintf "%%s\\n" "$@" >"%s/gogs_args"\n' "${work}" >"${work}/home/git/gogs/gogs"
+    chmod +x "${work}/bin/gosu" "${work}/home/git/gogs/gogs"
+}
+
+# Run the sandboxed entrypoint on an existing install.
+#   state: upgrade (no /etc/app_configured, app.ini present), upgrade-no-admin
+#   (the same without ADMIN_USER, ADMIN_PASS and ADMIN_EMAIL),
+#   restart-pending (marker and pending flag present) or restart (marker only).
+entrypoint_case() {
+    local state=$1 codes=$2 want_requests=$3
+    start_mock "${codes}"
+    mkdir -p "${work}/home/git/gogs/custom/conf"
+    if ! make_sandbox; then
         fail "entrypoint ${state}: could not sandbox the final exec"
         stop_mock
         return
     fi
     printf '[server]\nHTTP_PORT = 80\nSSH_PORT = 22\n' >"${work}/home/git/gogs/custom/conf/app.ini"
+    local install_env=("${admin_env[@]}")
     case "${state}" in
+        upgrade-no-admin) install_env=() ;;
         restart-pending) touch "${work}/app_configured" "${work}/callback_pending" ;;
         restart) touch "${work}/app_configured" ;;
     esac
-    run_sandboxed_entrypoint "${sandbox}" "entrypoint ${state} codes=${codes}" "${want_requests}" \
-        PATH="${gnu_sed_dir:+${gnu_sed_dir}:}${PATH}"
+    run_sandboxed_entrypoint "${work}/entrypoint.sh" "entrypoint ${state} codes=${codes}" "${want_requests}" \
+        ${install_env[@]+"${install_env[@]}"} PATH="${gnu_sed_dir:+${gnu_sed_dir}:}${PATH}"
     [[ -f "${work}/app_configured" ]] || fail "entrypoint ${state}: /etc/app_configured was not created"
+    stop_mock
+}
+
+# A first start with no app.ini writes app.ini, creates the admin user from
+# the install values and execs Gogs; the password reaches the gogs binary but
+# never the output.
+fresh_case() {
+    local codes=$1 want_requests=$2
+    start_mock "${codes}"
+    fresh_stubs
+    if ! make_sandbox; then
+        fail "entrypoint fresh: could not sandbox the final exec"
+        stop_mock
+        return
+    fi
+    run_sandboxed_entrypoint "${work}/entrypoint.sh" "entrypoint fresh codes=${codes}" "${want_requests}" \
+        "${admin_env[@]}" PATH="${work}/bin:${PATH}"
+    local expected
+    expected=$(printf '%s\n' admin create-user --name gateadmin --password "${admin_password}" \
+        --admin --email gate@example.test)
+    if grep -q '^INSTALL_LOCK = true$' "${work}/home/git/gogs/custom/conf/app.ini" 2>/dev/null \
+        && [[ -f "${work}/app_configured" && "$(cat "${work}/gogs_args" 2>/dev/null)" == "${expected}" ]]; then
+        pass "entrypoint fresh: app.ini written, admin user created from the install values"
+    else
+        fail "entrypoint fresh: app.ini, marker or create-user arguments"
+    fi
+    stop_mock
+}
+
+# Without one of the install values, a first start stops before setting
+# anything up: Gogs does not start, nothing is sent, and no marker, flag,
+# directory or app.ini is created.
+#   refused_case <variable> unset|empty
+refused_case() {
+    local name=$1 mode=$2 vars=() var
+    start_mock 200
+    fresh_stubs
+    if ! make_sandbox; then
+        fail "entrypoint with ${name} ${mode}: could not sandbox the final exec"
+        stop_mock
+        return
+    fi
+    for var in "${admin_env[@]}"; do
+        if [[ "${var%%=*}" != "${name}" ]]; then
+            vars+=("${var}")
+        elif [[ "${mode}" == empty ]]; then
+            vars+=("${name}=")
+        fi
+    done
+    run_limited 10 env -u ADMIN_USER -u ADMIN_PASS -u ADMIN_EMAIL \
+        INSTANCE_ID="${token_id}" CALLBACK_TOKEN="${header_token}" \
+        APPBOX_CALLBACK_BASE="http://127.0.0.1:${port}" "${vars[@]}" PATH="${work}/bin:${PATH}" \
+        "${work}/entrypoint.sh" bash -c "date +%s >'${work}/app_started'" >"${work}/output" 2>&1 </dev/null
+    local rc=$?
+    sleep 1
+    if [[ "${rc}" != 0 && "${rc}" != 124 && ! -f "${work}/app_started" && ! -f "${work}/callback_pending" \
+        && ! -f "${work}/app_configured" && ! -e "${work}/home/git/gogs/custom" && ! -f "${work}/gogs_args" \
+        && "$(request_count)" == 0 && "$(token_logged)" == 0 ]] \
+        && grep -q "^${name} is empty; refusing to set up Gogs" "${work}/output"; then
+        pass "entrypoint with ${name} ${mode}: exit ${rc}, Gogs not started, no callback, nothing written"
+    else
+        fail "entrypoint with ${name} ${mode}: exit=${rc} app_started=$([[ -f "${work}/app_started" ]] && echo yes || echo no) requests=$(request_count)"
+    fi
     stop_mock
 }
 
@@ -288,17 +379,34 @@ if sed --version 2>/dev/null | grep -q GNU || [[ -n "${gnu_sed_dir}" ]]; then
     entrypoint_case upgrade 200 1
     entrypoint_case upgrade 401 1
     entrypoint_case upgrade 403 1
+    entrypoint_case upgrade-no-admin 200 1
 else
     echo "skip entrypoint upgrade cases: GNU sed (or gsed) is not installed"
 fi
 entrypoint_case restart-pending 503,200 2
 entrypoint_case restart 200 0
+fresh_case 200 1
+fresh_case 401 1
+for name in ADMIN_USER ADMIN_PASS ADMIN_EMAIL; do
+    refused_case "${name}" unset
+    refused_case "${name}" empty
+done
 [[ -n "${gnu_sed_dir}" ]] && rm -rf "${gnu_sed_dir}"
 
 if grep -q 'apps/installed' "${entrypoint}"; then
     fail "entrypoint.sh still calls the installed callback itself"
 else
     pass "entrypoint.sh leaves the callback to the background helper"
+fi
+if grep -qE '^[[:space:]]*set -[a-z]*x' "${entrypoint}"; then
+    fail "entrypoint.sh turns on command tracing"
+else
+    pass "entrypoint.sh does not trace its commands"
+fi
+if grep -qE 'ADMIN_(USER|PASS|EMAIL):-' "${entrypoint}"; then
+    fail "entrypoint.sh has a default for an install value"
+else
+    pass "entrypoint.sh has no defaults for the install values"
 fi
 flag_order_check '^ *touch "\$\{CALLBACK_PENDING_FLAG\}"$' '^ *touch "\$\{CONFIG_FLAG\}"$'
 

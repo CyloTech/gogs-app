@@ -29,8 +29,8 @@ app:
 
 image:
   name: "gogs"
-  version: "0.14.2"
-  tag: "0.14.2"
+  version: "0.14.2-1"
+  tag: "0.14.2-1"
 
 container:
   cmd: null
