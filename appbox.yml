@@ -1,0 +1,169 @@
+app:
+  display_name: "Gogs"
+  publisher: "Gogs"
+  description: |
+    Gogs is a painless self-hosted Git service written in Go. It provides a lightweight alternative to GitLab and GitHub with a familiar web interface, issue tracking, wiki, and organization support.
+
+    ## Features
+
+    - Git hosting over HTTP and built-in SSH server
+    - Repository management with web-based file browser and diff viewer
+    - Issue tracker with labels, milestones, and assignees
+    - Organization and team access control
+    - Repository webhooks for CI/CD integration
+    - Wiki per repository for lightweight documentation
+    - Minimal resource footprint — runs well on small instances
+
+    ## Ideal For
+
+    - Developers who want a private Git server without the overhead of GitLab
+    - Small teams needing issue tracking and code review in one place
+    - Self-hosters looking for a lightweight, Go-based Git forge
+
+  short_description: "A painless self-hosted Git service"
+  icon: icon.png
+  categories:
+    - "Programming"
+  devsite: "https://gogs.io"
+  source_repo: "https://github.com/gogs/gogs"
+
+image:
+  name: "gogs"
+  version: "0.14.2"
+  tag: "0.14.2"
+
+container:
+  cmd: null
+  user: null
+  group_add: null
+  memory: 1
+  memory_swap: 0
+  memory_reservation: 0
+  cpus: 0
+  init: false
+  cap_add: null
+  cap_drop: null
+  shm_size: null
+  pids_limit: null
+
+networking:
+  subdomain: "gogs"
+  is_web_app: true
+  requires_domain: true
+  ssl: true
+  multiple_domains: false
+  tcp_passthrough: false
+
+behavior:
+  app_slots: 1
+  expect_callback: true
+  callback_requires_auth: false
+  restart_text: null
+  can_update: true
+  update_text: null
+  allow_downgrade: false
+  ssl_restart: false
+
+install:
+  pre_description: "Choose an admin username, password, and email for your Gogs instance."
+  post_description: "Your Git server is ready! Log in with the credentials you chose during installation."
+  custom_description: null
+
+# SSH is exposed as a public TCP port. The web UI is reverse-proxied via
+# nginx (VIRTUAL_PORT), so no HTTP port is listed here.
+ports:
+  tcp:
+    range: "10022"
+    dynamic: 0
+  udp:
+    range: null
+    dynamic: 0
+  combined:
+    range: null
+    dynamic: 0
+
+# BACKWARD COMPATIBLE: these source names and destination paths must match
+# the existing platform database entries for app 111. Verify against the
+# live appbinds rows before deploying a version change.
+volumes:
+  - source: "custom"
+    destination: "/home/git/gogs/custom"
+    permissions: "rw"
+    uid: 1000
+
+  - source: "data"
+    destination: "/home/git/gogs/data"
+    permissions: "rw"
+    uid: 1000
+
+  - source: "repositories"
+    destination: "/home/git/repositories"
+    permissions: "rw"
+    uid: 1000
+
+shared_data: []
+
+env:
+  - key: VIRTUAL_PORT
+    value: "3000"
+    template_type: none
+
+  # External SSH port shown in Gogs clone URLs. The built-in SSH server
+  # listens on 10022 internally; the platform maps it to this external port.
+  - key: SSH_PORT
+    value: "%PORTS|0.EXTERNAL%"
+    template_type: instance
+
+  - key: DOMAIN
+    value: "%DOMAIN.DOMAIN%"
+    template_type: instance
+
+custom_fields:
+  ADMIN_USER:
+    label: "Admin Username"
+    type: dynamicText
+    width: 6
+    default_value: "gogsadmin"
+    template_type: none
+    validate:
+      - required
+      - alphanumeric
+      - { minLength: 3 }
+    params: {}
+
+  ADMIN_PASS:
+    label: "Admin Password"
+    type: complexPassword
+    width: 6
+    default_value: null
+    template_type: password
+    validate:
+      - required
+      - complexPassword
+    params: {}
+
+  ADMIN_EMAIL:
+    label: "Admin Email"
+    type: email
+    width: 6
+    default_value: ""
+    template_type: none
+    validate:
+      - required
+      - email
+    params: {}
+
+  ROOT_URL:
+    label: "Site URL"
+    type: externalURL
+    width: 6
+    default_value: "https://%DOMAIN.DOMAIN%/"
+    template_type: instance
+    validate: []
+    params: {}
+
+advanced:
+  devices: []
+  ulimits: []
+  sysctls: []
+  chains: []

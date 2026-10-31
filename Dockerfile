@@ -1,38 +1,32 @@
-FROM ubuntu:18.04
+FROM ubuntu:24.04
 
-ENV HOME=/home/git \
-    DEBIAN_FRONTEND=noninteractive \
-    GOGS_VERSION=0.11.53 \
-    ADMIN_USER=gogsadmin \
-    ADMIN_PASS=admin \
-    ADMIN_EMAIL=admin@test.com \
-    HTTP_PORT=80 \
-    SSH_PORT=10022 \
-    DOMAIN=localhost \
-    ROOT_URL=http://localhost:80/
+ENV DEBIAN_FRONTEND=noninteractive \
+    HOME=/home/git
 
-RUN apt update
-RUN apt install -y wget \
-                   curl \
-                   nano \
-                   git \
-                   supervisor \
-                   libcap2-bin \
-                   pwgen
+ARG GOGS_VERSION=0.14.2
 
-RUN adduser --system --disabled-password --home ${HOME} --shell /sbin/nologin --group --uid 1000 git
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        bash ca-certificates curl gosu git openssh-client python3 sqlite3 && \
+    rm -rf /var/lib/apt/lists/*
 
+# Ubuntu 24.04 ships with user "ubuntu" at UID 1000. Rename to "git"
+# so the home directory and process ownership read naturally in logs.
+RUN usermod -l git -d /home/git -m ubuntu && \
+    usermod --shell /usr/sbin/nologin --home /home/git git && \
+    groupmod -n git ubuntu
+
+# TARGETARCH is set automatically by Docker (amd64, arm64, etc.).
+ARG TARGETARCH
 RUN cd /home/git && \
-    wget https://cdn.gogs.io/${GOGS_VERSION}/gogs_${GOGS_VERSION}_linux_amd64.tar.gz && \
-    tar -xvf gogs_${GOGS_VERSION}_linux_amd64.tar.gz && \
-    rm -fr /home/git/gogs_*
+    curl -fsSL "https://github.com/gogs/gogs/releases/download/v${GOGS_VERSION}/gogs_v${GOGS_VERSION}_linux_${TARGETARCH}.tar.gz" | tar xz && \
+    chown -R 1000:1000 /home/git
 
-ADD /scripts /scripts
-RUN chmod -R +x /scripts
+ADD entrypoint.sh /entrypoint.sh
+ADD moduser.sh /moduser.sh
+RUN chmod +x /entrypoint.sh /moduser.sh
 
-EXPOSE 80
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["/home/git/gogs/gogs", "web"]
 
-RUN apt autoremove -y && apt clean
-RUN rm -rf /var/lib/apt/lists/*
-
-ENTRYPOINT [ "/scripts/Entrypoint.sh" ]
+EXPOSE 3000 10022
